@@ -1,0 +1,91 @@
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.7.7
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  kafka:
+    image: confluentinc/cp-kafka:7.7.7
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_MESSAGE_MAX_BYTES: 104857675
+      KAFKA_REPLICA_FETCH_MAX_BYTES: 104857675
+      KAFKA_FETCH_MAX_BYTES: 104857675
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.7.7
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists \
+          --topic test-topic --partitions 1 --replication-factor 1
+    restart: on-failure
+
+  producer:
+    build: .
+    command:
+      - /app/producer
+      - -brokers=kafka:9092
+      - -topic=test-topic
+      - -payload-size=5MiB
+      - -rate=500ms
+      - -pprof-addr=:6060
+    ports:
+      - "6060:6060"
+    environment:
+      - GOMEMLIMIT=256MiB
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+
+  # sink:
+  #   build: .
+  #   command:
+  #     - /app/sink
+  #     - -addr=:8080
+  #     - -sleep=250ms
+  #     - -pprof-addr=:6060
+  #   ports:
+  #     - "6062:6060"
+  #   restart: unless-stopped
+  #   deploy:
+  #     resources:
+  #       limits:
+  #         memory: 256m
+
+  consumer:
+    build: .
+    command:
+      - /app/consumer
+      - -brokers=kafka:9092
+      - -topic=test-topic
+      - -group=reproducer
+      - -concurrency=2
+      # - -sink-url=http://sink:8080/
+      - -sleep=250ms
+      - -fetch-max-bytes=50MiB
+      - -fetch-max-partition-bytes=10MiB
+      - -pprof-addr=:6060
+    ports:
+      - "6061:6060"
+    environment:
+      - GOMEMLIMIT=1GiB
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1g
