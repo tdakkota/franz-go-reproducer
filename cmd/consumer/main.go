@@ -99,32 +99,40 @@ func consume(ctx context.Context, cl *kgo.Client, concurrency int, sleep time.Du
 
 		for _, rec := range records {
 			grp.Go(func() error {
-				select {
-				case <-grpCtx.Done():
-					return grpCtx.Err()
-				default:
+				defer func() {
+					logger.Info("sent request", zap.Int64("offset", rec.Offset))
+				}()
+				if sinkURL == "" {
+					select {
+					case <-grpCtx.Done():
+						return grpCtx.Err()
+					case <-time.After(sleep):
+						return nil
+					}
 				}
-				if sinkURL != "" {
-					req, err := http.NewRequestWithContext(grpCtx, http.MethodPost, sinkURL, bytes.NewReader(rec.Value))
-					if err != nil {
-						return err
-					}
-					start := time.Now()
-					resp, err := httpClient.Do(req)
-					if err != nil {
-						return err
-					}
-					_, _ = io.Copy(io.Discard, resp.Body)
+
+				req, err := http.NewRequestWithContext(grpCtx, http.MethodPost, sinkURL, bytes.NewReader(rec.Value))
+				if err != nil {
+					return err
+				}
+
+				start := time.Now()
+				resp, err := httpClient.Do(req)
+				if err != nil {
+					return err
+				}
+				defer func() {
 					_ = resp.Body.Close()
-					dur := time.Since(start)
-					pushCount.Add(1)
-					totalPushNs.Add(dur.Nanoseconds())
-					lastPushNs.Store(dur.Nanoseconds())
-					if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-						return fmt.Errorf("sink returned %d", resp.StatusCode)
-					}
-				} else {
-					time.Sleep(sleep)
+				}()
+				_, _ = io.Copy(io.Discard, resp.Body)
+
+				dur := time.Since(start)
+				pushCount.Add(1)
+				totalPushNs.Add(dur.Nanoseconds())
+				lastPushNs.Store(dur.Nanoseconds())
+
+				if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+					return fmt.Errorf("sink returned %d", resp.StatusCode)
 				}
 				return nil
 			})
@@ -144,6 +152,24 @@ func consume(ctx context.Context, cl *kgo.Client, concurrency int, sleep time.Du
 		consumed.Add(int64(len(records)))
 		consumedBytes.Add(batchBytes)
 	}
+}
+
+type readHook struct {
+	logger *zap.Logger
+}
+
+var _ kgo.HookFetchBatchRead = (*readHook)(nil)
+
+func (h *readHook) OnFetchBatchRead(meta kgo.BrokerMetadata, topic string, partition int32, metrics kgo.FetchBatchMetrics) {
+	h.logger.Info("fetch batch read",
+		zap.Int32("broker_id", meta.NodeID),
+		zap.String("topic", topic),
+		zap.Int32("partition", partition),
+		zap.Int("num_records", metrics.NumRecords),
+		zap.Int("compressed_bytes", metrics.CompressedBytes),
+		zap.Int("uncompressed_bytes", metrics.UncompressedBytes),
+		zap.Uint8("compression_type", metrics.CompressionType),
+	)
 }
 
 func main() {
@@ -207,10 +233,10 @@ func main() {
 		kgo.ConsumeTopics(*topic),
 		kgo.InstanceID(hostname + "-" + *topic),
 		kgo.DisableAutoCommit(),
-		kgo.WithContext(grpCtx),
 		kgo.FetchMaxBytes(int32(fetchMaxBytes)),
 		kgo.FetchMaxPartitionBytes(int32(fetchMaxPartitionBytes)),
 		kgo.WithLogger(kzap.New(logger.Named("kafka"), kzap.AtomicLevel(atomicLevel))),
+		kgo.WithHooks(&readHook{logger: logger}),
 	}
 	if *maxConcurrentFetches > 0 {
 		opts = append(opts, kgo.MaxConcurrentFetches(*maxConcurrentFetches))
