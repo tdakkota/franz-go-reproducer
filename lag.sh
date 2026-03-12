@@ -4,8 +4,9 @@ set -euo pipefail
 BROKER="${BROKER:-kafka:9092}"
 TOPIC="${TOPIC:-test-topic}"
 GROUP="${GROUP:-reproducer}"
+DOCKER="${DOCKER:-docker}"
 
-nerdctl compose exec kafka \
+$DOCKER compose exec kafka \
   kafka-consumer-groups \
     --bootstrap-server "$BROKER" \
     --group "$GROUP" \
