@@ -12,9 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/IBM/sarama"
 	"github.com/dustin/go-humanize"
-	"github.com/twmb/franz-go/pkg/kgo"
-	"github.com/twmb/franz-go/plugin/kzap"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -22,7 +21,7 @@ import (
 // bytesFlag is a flag.Value that accepts human-readable byte sizes (e.g. "1MiB", "50MB").
 type bytesFlag uint64
 
-func (b *bytesFlag) String() string        { return humanize.IBytes(uint64(*b)) }
+func (b *bytesFlag) String() string { return humanize.IBytes(uint64(*b)) }
 func (b *bytesFlag) Set(s string) error {
 	v, err := humanize.ParseBytes(s)
 	if err != nil {
@@ -38,10 +37,10 @@ func main() {
 	rate := flag.Duration("rate", 500*time.Millisecond, "Interval between produces")
 	pprofAddr := flag.String("pprof-addr", ":6060", "pprof HTTP listen address (empty to disable)")
 
-	payloadSize := bytesFlag(5 << 20)        // 5 MiB
-	batchMaxBytes := bytesFlag(10 << 20)    // 10 MiB — must exceed payload + framing overhead
+	payloadSize := bytesFlag(5 << 20)      // 5 MiB
+	maxMessageBytes := bytesFlag(10 << 20) // 10 MiB — must exceed payload + framing overhead
 	flag.Var(&payloadSize, "payload-size", "Payload size, human-readable (e.g. 1MiB, 512KB)")
-	flag.Var(&batchMaxBytes, "batch-max-bytes", "ProducerBatchMaxBytes, human-readable (e.g. 10MiB)")
+	flag.Var(&maxMessageBytes, "max-message-bytes", "Producer.MaxMessageBytes, human-readable (e.g. 10MiB)")
 	logLevelStr := flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 
 	flag.Parse()
@@ -73,16 +72,23 @@ func main() {
 		}()
 	}
 
-	cl, err := kgo.NewClient(
-		kgo.SeedBrokers(strings.Split(*brokers, ",")...),
-		kgo.ProducerBatchCompression(kgo.ZstdCompression()),
-		kgo.ProducerBatchMaxBytes(int32(batchMaxBytes)),
-		kgo.WithLogger(kzap.New(logger.Named("kafka"), kzap.AtomicLevel(atomicLevel))),
-	)
+	saramaLogger, _ := zap.NewStdLogAt(logger.Named("sarama"), zapcore.DebugLevel)
+	sarama.Logger = saramaLogger
+
+	saramaConfig := sarama.NewConfig()
+	saramaConfig.Version = sarama.V2_8_0_0
+	saramaConfig.Producer.RequiredAcks = sarama.WaitForAll
+	saramaConfig.Producer.Compression = sarama.CompressionZSTD
+	saramaConfig.Producer.MaxMessageBytes = int(maxMessageBytes)
+	saramaConfig.Producer.Return.Successes = true
+
+	producer, err := sarama.NewSyncProducer(strings.Split(*brokers, ","), saramaConfig)
 	if err != nil {
-		logger.Fatal("create kafka client", zap.Error(err))
+		logger.Fatal("create producer", zap.Error(err))
 	}
-	defer cl.Close()
+	defer func() {
+		_ = producer.Close()
+	}()
 
 	payload := make([]byte, payloadSize)
 	for i := range payload {
@@ -96,7 +102,7 @@ func main() {
 	logger.Info("producer started",
 		zap.String("topic", *topic),
 		zap.String("payload_size", payloadSize.String()),
-		zap.String("batch_max_bytes", batchMaxBytes.String()),
+		zap.String("max_message_bytes", maxMessageBytes.String()),
 		zap.Duration("rate", *rate),
 	)
 
@@ -125,11 +131,11 @@ func main() {
 			)
 			return
 		case <-ticker.C:
-			rec := &kgo.Record{
+			msg := &sarama.ProducerMessage{
 				Topic: *topic,
-				Value: payload,
+				Value: sarama.ByteEncoder(payload),
 			}
-			if err := cl.ProduceSync(ctx, rec).FirstErr(); err != nil {
+			if _, _, err := producer.SendMessage(msg); err != nil {
 				logger.Error("produce error", zap.Error(err))
 				continue
 			}

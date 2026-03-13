@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -14,9 +15,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/IBM/sarama"
 	"github.com/dustin/go-humanize"
-	"github.com/twmb/franz-go/pkg/kgo"
-	"github.com/twmb/franz-go/plugin/kzap"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"golang.org/x/sync/errgroup"
@@ -35,159 +35,101 @@ func (b *bytesFlag) Set(s string) error {
 	return nil
 }
 
-func consume(ctx context.Context, cl *kgo.Client, concurrency int, sleep time.Duration, sinkURL string, httpClient *http.Client, logger *zap.Logger) error {
-	var consumed, consumedBytes atomic.Int64
-	var pushCount, totalPushNs, lastPushNs atomic.Int64
+type consumerHandler struct {
+	concurrency int
+	sleep       time.Duration
+	sinkURL     string
+	httpClient  *http.Client
+	logger      *zap.Logger
 
-	go func() {
-		t := time.NewTicker(10 * time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				fields := []zap.Field{
-					zap.Int64("records", consumed.Load()),
-					zap.String("bytes", humanize.IBytes(uint64(consumedBytes.Load()))),
-				}
-				if n := pushCount.Load(); n > 0 {
-					avg := time.Duration(totalPushNs.Load() / n)
-					last := time.Duration(lastPushNs.Load())
-					fields = append(fields,
-						zap.Int64("push_requests", n),
-						zap.Duration("push_avg_latency", avg),
-						zap.Duration("push_last_latency", last),
-					)
-				}
-				logger.Info("consumed", fields...)
-			}
-		}
-	}()
+	consumed      atomic.Int64
+	consumedBytes atomic.Int64
+	pushCount     atomic.Int64
+	totalPushNs   atomic.Int64
+	lastPushNs    atomic.Int64
+}
+
+func (h *consumerHandler) Setup(_ sarama.ConsumerGroupSession) error   { return nil }
+func (h *consumerHandler) Cleanup(_ sarama.ConsumerGroupSession) error { return nil }
+
+func (h *consumerHandler) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+	grp, grpCtx := errgroup.WithContext(session.Context())
+	grp.SetLimit(h.concurrency)
 
 	for {
 		select {
-		case <-ctx.Done():
-			logger.Info("consumer stopped",
-				zap.Int64("consumed_records", consumed.Load()),
-				zap.String("consumed_bytes", humanize.IBytes(uint64(consumedBytes.Load()))),
-			)
-			return nil
-		default:
-		}
-
-		fetches := cl.PollRecords(ctx, concurrency)
-		if errs := fetches.Errors(); len(errs) > 0 {
-			for _, e := range errs {
-				logger.Error("fetch error", zap.Error(e.Err))
+		case msg, ok := <-claim.Messages():
+			if !ok {
+				return grp.Wait()
 			}
-		}
-
-		if fetches.Empty() {
-			continue
-		}
-
-		records := fetches.Records()
-
-		var batchBytes int64
-		for _, rec := range records {
-			batchBytes += int64(len(rec.Value))
-		}
-
-		grp, grpCtx := errgroup.WithContext(ctx)
-		grp.SetLimit(concurrency)
-
-		for _, rec := range records {
 			grp.Go(func() error {
-				defer func() {
-					logger.Info("sent request", zap.Int64("offset", rec.Offset))
-				}()
-				if sinkURL == "" {
-					select {
-					case <-grpCtx.Done():
-						return grpCtx.Err()
-					case <-time.After(sleep):
-						return nil
-					}
-				}
-
-				req, err := http.NewRequestWithContext(grpCtx, http.MethodPost, sinkURL, bytes.NewReader(rec.Value))
-				if err != nil {
+				if err := h.processRecord(grpCtx, msg.Value); err != nil {
 					return err
 				}
-
-				start := time.Now()
-				resp, err := httpClient.Do(req)
-				if err != nil {
-					return err
-				}
-				defer func() {
-					_ = resp.Body.Close()
-				}()
-				_, _ = io.Copy(io.Discard, resp.Body)
-
-				dur := time.Since(start)
-				pushCount.Add(1)
-				totalPushNs.Add(dur.Nanoseconds())
-				lastPushNs.Store(dur.Nanoseconds())
-
-				if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-					return fmt.Errorf("sink returned %d", resp.StatusCode)
-				}
+				session.MarkMessage(msg, "")
+				h.consumed.Add(1)
+				h.consumedBytes.Add(int64(len(msg.Value)))
 				return nil
 			})
+		case <-grpCtx.Done():
+			_ = grp.Wait()
+			return grpCtx.Err()
 		}
-
-		if err := grp.Wait(); err != nil {
-			logger.Error("process error", zap.Error(err))
-			continue
-		}
-
-		// Commit with the original ctx, not the errgroup ctx,
-		// to avoid cancellation races on errgroup completion.
-		if err := cl.CommitRecords(ctx, records...); err != nil {
-			logger.Error("commit error", zap.Error(err))
-		}
-
-		consumed.Add(int64(len(records)))
-		consumedBytes.Add(batchBytes)
 	}
 }
 
-type readHook struct {
-	logger *zap.Logger
-}
+func (h *consumerHandler) processRecord(ctx context.Context, value []byte) error {
+	if h.sinkURL == "" {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(h.sleep):
+			return nil
+		}
+	}
 
-var _ kgo.HookFetchBatchRead = (*readHook)(nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.sinkURL, bytes.NewReader(value))
+	if err != nil {
+		return err
+	}
 
-func (h *readHook) OnFetchBatchRead(meta kgo.BrokerMetadata, topic string, partition int32, metrics kgo.FetchBatchMetrics) {
-	h.logger.Info("fetch batch read",
-		zap.Int32("broker_id", meta.NodeID),
-		zap.String("topic", topic),
-		zap.Int32("partition", partition),
-		zap.Int("num_records", metrics.NumRecords),
-		zap.Int("compressed_bytes", metrics.CompressedBytes),
-		zap.Int("uncompressed_bytes", metrics.UncompressedBytes),
-		zap.Uint8("compression_type", metrics.CompressionType),
-	)
+	start := time.Now()
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	dur := time.Since(start)
+	h.pushCount.Add(1)
+	h.totalPushNs.Add(dur.Nanoseconds())
+	h.lastPushNs.Store(dur.Nanoseconds())
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("sink returned %d", resp.StatusCode)
+	}
+	return nil
 }
 
 func main() {
 	brokers := flag.String("brokers", "localhost:9092", "Comma-separated Kafka broker addresses")
 	topic := flag.String("topic", "test-topic", "Kafka topic")
 	group := flag.String("group", "reproducer", "Consumer group ID")
-	concurrency := flag.Int("concurrency", 10, "Max concurrent record processors / PollRecords max")
+	concurrency := flag.Int("concurrency", 10, "Max concurrent record processors")
 	sleep := flag.Duration("sleep", 500*time.Millisecond, "Sleep per record when -sink-url is not set")
 	sinkURL := flag.String("sink-url", "", "HTTP sink URL to POST each record to (e.g. http://sink:8080/)")
 	pushTimeout := flag.Duration("push-timeout", 10*time.Second, "HTTP push timeout per record")
 	pprofAddr := flag.String("pprof-addr", ":6060", "pprof HTTP listen address (empty to disable)")
-	maxConcurrentFetches := flag.Int("max-concurrent-fetches", 1, "MaxConcurrentFetches (0 = default)")
+	channelBufferSize := flag.Int("channel-buffer-size", 10, "Sarama ChannelBufferSize (messages buffered per partition)")
 	logLevelStr := flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 
-	fetchMaxBytes := bytesFlag(50 << 20)          // 50 MiB
-	fetchMaxPartitionBytes := bytesFlag(10 << 20) // 10 MiB
-	flag.Var(&fetchMaxBytes, "fetch-max-bytes", "FetchMaxBytes, human-readable (e.g. 50MiB)")
-	flag.Var(&fetchMaxPartitionBytes, "fetch-max-partition-bytes", "FetchMaxPartitionBytes, human-readable (e.g. 10MiB)")
+	fetchMaxBytes := bytesFlag(50 << 20)     // 50 MiB
+	fetchDefaultBytes := bytesFlag(10 << 20) // 10 MiB
+	flag.Var(&fetchMaxBytes, "fetch-max-bytes", "Consumer.Fetch.Max, human-readable (e.g. 50MiB)")
+	flag.Var(&fetchDefaultBytes, "fetch-default-bytes", "Consumer.Fetch.Default, human-readable (e.g. 10MiB)")
 
 	flag.Parse()
 
@@ -218,36 +160,59 @@ func main() {
 		}()
 	}
 
-	hostname, err := os.Hostname()
+	saramaLogger, _ := zap.NewStdLogAt(logger.Named("sarama"), zapcore.DebugLevel)
+	sarama.Logger = saramaLogger
+
+	saramaConfig := sarama.NewConfig()
+	saramaConfig.Version = sarama.V2_8_0_0
+	saramaConfig.Consumer.Fetch.Max = int32(fetchMaxBytes)
+	saramaConfig.Consumer.Fetch.Default = int32(fetchDefaultBytes)
+	saramaConfig.Consumer.Offsets.AutoCommit.Enable = true
+	saramaConfig.Consumer.Offsets.AutoCommit.Interval = 1 * time.Second
+	saramaConfig.Consumer.Offsets.Initial = sarama.OffsetOldest
+	saramaConfig.ChannelBufferSize = *channelBufferSize
+
+	consumerGroup, err := sarama.NewConsumerGroup(strings.Split(*brokers, ","), *group, saramaConfig)
 	if err != nil {
-		logger.Fatal("get hostname", zap.Error(err))
+		logger.Fatal("create consumer group", zap.Error(err))
+	}
+	defer func() {
+		_ = consumerGroup.Close()
+	}()
+
+	handler := &consumerHandler{
+		concurrency: *concurrency,
+		sleep:       *sleep,
+		sinkURL:     *sinkURL,
+		httpClient:  &http.Client{Timeout: *pushTimeout},
+		logger:      logger,
 	}
 
-	// Mirror the reference: the Kafka client receives the errgroup context,
-	// tying its lifecycle to the consumer goroutine group.
-	grp, grpCtx := errgroup.WithContext(ctx)
-
-	opts := []kgo.Opt{
-		kgo.SeedBrokers(strings.Split(*brokers, ",")...),
-		kgo.ConsumerGroup(*group),
-		kgo.ConsumeTopics(*topic),
-		kgo.InstanceID(hostname + "-" + *topic),
-		kgo.DisableAutoCommit(),
-		kgo.FetchMaxBytes(int32(fetchMaxBytes)),
-		kgo.FetchMaxPartitionBytes(int32(fetchMaxPartitionBytes)),
-		kgo.WithLogger(kzap.New(logger.Named("kafka"), kzap.AtomicLevel(atomicLevel))),
-		kgo.WithHooks(&readHook{logger: logger}),
-	}
-	if *maxConcurrentFetches > 0 {
-		opts = append(opts, kgo.MaxConcurrentFetches(*maxConcurrentFetches))
-	}
-
-	cl, err := kgo.NewClient(opts...)
-	if err != nil {
-		logger.Fatal("create kafka client", zap.Error(err))
-	}
-
-	httpClient := &http.Client{Timeout: *pushTimeout}
+	go func() {
+		t := time.NewTicker(10 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				fields := []zap.Field{
+					zap.Int64("records", handler.consumed.Load()),
+					zap.String("bytes", humanize.IBytes(uint64(handler.consumedBytes.Load()))),
+				}
+				if n := handler.pushCount.Load(); n > 0 {
+					avg := time.Duration(handler.totalPushNs.Load() / n)
+					last := time.Duration(handler.lastPushNs.Load())
+					fields = append(fields,
+						zap.Int64("push_requests", n),
+						zap.Duration("push_avg_latency", avg),
+						zap.Duration("push_last_latency", last),
+					)
+				}
+				logger.Info("consumed", fields...)
+			}
+		}
+	}()
 
 	logger.Info("consumer started",
 		zap.String("topic", *topic),
@@ -256,15 +221,24 @@ func main() {
 		zap.Duration("sleep", *sleep),
 		zap.String("sink_url", *sinkURL),
 		zap.String("fetch_max_bytes", fetchMaxBytes.String()),
-		zap.String("fetch_max_partition_bytes", fetchMaxPartitionBytes.String()),
+		zap.String("fetch_default_bytes", fetchDefaultBytes.String()),
 	)
 
-	grp.Go(func() error {
-		defer cl.Close()
-		return consume(grpCtx, cl, *concurrency, *sleep, *sinkURL, httpClient, logger)
-	})
-
-	if err := grp.Wait(); err != nil {
-		logger.Fatal("consumer error", zap.Error(err))
+	topics := []string{*topic}
+	for {
+		if err := consumerGroup.Consume(ctx, topics, handler); err != nil {
+			if errors.Is(err, sarama.ErrClosedConsumerGroup) {
+				break
+			}
+			logger.Error("consume error", zap.Error(err))
+		}
+		if ctx.Err() != nil {
+			break
+		}
 	}
+
+	logger.Info("consumer stopped",
+		zap.Int64("consumed_records", handler.consumed.Load()),
+		zap.String("consumed_bytes", humanize.IBytes(uint64(handler.consumedBytes.Load()))),
+	)
 }
