@@ -22,7 +22,7 @@ import (
 // bytesFlag is a flag.Value that accepts human-readable byte sizes (e.g. "1MiB", "50MB").
 type bytesFlag uint64
 
-func (b *bytesFlag) String() string        { return humanize.IBytes(uint64(*b)) }
+func (b *bytesFlag) String() string { return humanize.IBytes(uint64(*b)) }
 func (b *bytesFlag) Set(s string) error {
 	v, err := humanize.ParseBytes(s)
 	if err != nil {
@@ -38,8 +38,8 @@ func main() {
 	rate := flag.Duration("rate", 500*time.Millisecond, "Interval between produces")
 	pprofAddr := flag.String("pprof-addr", ":6060", "pprof HTTP listen address (empty to disable)")
 
-	payloadSize := bytesFlag(5 << 20)        // 5 MiB
-	batchMaxBytes := bytesFlag(10 << 20)    // 10 MiB — must exceed payload + framing overhead
+	payloadSize := bytesFlag(5 << 20)    // 5 MiB
+	batchMaxBytes := bytesFlag(10 << 20) // 10 MiB — must exceed payload + framing overhead
 	flag.Var(&payloadSize, "payload-size", "Payload size, human-readable (e.g. 1MiB, 512KB)")
 	flag.Var(&batchMaxBytes, "batch-max-bytes", "ProducerBatchMaxBytes, human-readable (e.g. 10MiB)")
 	logLevelStr := flag.String("log-level", "info", "Log level (debug, info, warn, error)")

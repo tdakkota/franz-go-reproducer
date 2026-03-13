@@ -10,7 +10,7 @@ services:
     image: confluentinc/cp-kafka:7.7.7
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      test: [ "CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list" ]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -26,7 +26,7 @@ services:
 
   kafka-init:
     image: confluentinc/cp-kafka:7.7.7
-    entrypoint: ["/bin/sh", "-c"]
+    entrypoint: [ "/bin/sh", "-c" ]
     command:
       - |
         kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists \
@@ -74,11 +74,11 @@ services:
       - -brokers=kafka:9092
       - -topic=test-topic
       - -group=reproducer
-      - -concurrency=2
+      - -max-poll-records=2
       # - -sink-url=http://sink:8080/
       - -sleep=250ms
-      - -fetch-max-bytes=50MiB
-      - -fetch-max-partition-bytes=10MiB
+      - -fetch-max-bytes=10MiB
+      - -fetch-max-partition-bytes=5MiB
       - -pprof-addr=:6060
     ports:
       - "6061:6060"

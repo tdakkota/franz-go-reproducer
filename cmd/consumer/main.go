@@ -10,13 +10,11 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
-	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"github.com/dustin/go-humanize"
-	"github.com/twmb/franz-go/pkg/kgo"
-	"github.com/twmb/franz-go/plugin/kzap"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"golang.org/x/sync/errgroup"
@@ -35,7 +33,105 @@ func (b *bytesFlag) Set(s string) error {
 	return nil
 }
 
-func consume(ctx context.Context, cl *kgo.Client, concurrency int, sleep time.Duration, sinkURL string, httpClient *http.Client, logger *zap.Logger) error {
+// collectBatch polls up to maxRecords messages, returning as soon as the batch
+// is full or there are no more messages immediately available.
+func collectBatch(ctx context.Context, c *kafka.Consumer, maxRecords int, logger *zap.Logger) ([]*kafka.Message, error) {
+	var batch []*kafka.Message
+	for len(batch) < maxRecords {
+		select {
+		case <-ctx.Done():
+			return batch, nil
+		default:
+			if c.IsClosed() {
+				return nil, fmt.Errorf("client is closed")
+			}
+		}
+
+		ev := c.Poll(100) // 100 ms
+		if ev == nil {
+			if len(batch) > 0 {
+				// Return partial batch rather than waiting for it to fill.
+				return batch, nil
+			}
+			continue
+		}
+
+		switch e := ev.(type) {
+		case *kafka.Message:
+			if e.TopicPartition.Error != nil {
+				logger.Warn("partition error", zap.Error(e.TopicPartition.Error))
+				continue
+			}
+			batch = append(batch, e)
+		case kafka.Error:
+			if e.IsFatal() {
+				return batch, fmt.Errorf("fatal kafka error: %w", e)
+			}
+			logger.Warn("kafka error", zap.Error(e))
+		default:
+			// AssignedPartitions, RevokedPartitions, OffsetsCommitted, etc.
+			// These are handled automatically by librdkafka when using nil rebalance callback.
+			logger.Info("kafka event", zap.String("type", fmt.Sprintf("%T", ev)))
+		}
+	}
+	return batch, nil
+}
+
+// seekBack rewinds each partition to the earliest offset seen in the batch,
+// causing the records to be re-delivered on the next poll.
+func seekBack(c *kafka.Consumer, batch []*kafka.Message, logger *zap.Logger) {
+	min := make(map[int32]kafka.TopicPartition)
+	for _, msg := range batch {
+		cur, ok := min[msg.TopicPartition.Partition]
+		if !ok || msg.TopicPartition.Offset < cur.Offset {
+			min[msg.TopicPartition.Partition] = msg.TopicPartition
+		}
+	}
+
+	partitions := make([]kafka.TopicPartition, 0, len(min))
+	for _, tp := range min {
+		partitions = append(partitions, tp)
+	}
+
+	result, err := c.SeekPartitions(partitions)
+	if err != nil {
+		logger.Error("seek failed", zap.Error(err))
+		return
+	}
+	for _, tp := range result {
+		if tp.Error != nil {
+			logger.Error("seek partition failed",
+				zap.String("topic", *tp.Topic),
+				zap.Int32("partition", tp.Partition),
+				zap.Int64("offset", int64(tp.Offset)),
+				zap.Error(tp.Error),
+			)
+		}
+	}
+}
+
+// commitBatch commits the highest offset per partition in the batch (offset+1
+// is what librdkafka stores, as CommitMessage follows the Kafka convention).
+func commitBatch(c *kafka.Consumer, batch []*kafka.Message, logger *zap.Logger) {
+	max := make(map[int32]*kafka.Message)
+	for _, msg := range batch {
+		cur, ok := max[msg.TopicPartition.Partition]
+		if !ok || msg.TopicPartition.Offset > cur.TopicPartition.Offset {
+			max[msg.TopicPartition.Partition] = msg
+		}
+	}
+	for _, msg := range max {
+		if _, err := c.CommitMessage(msg); err != nil {
+			logger.Error("commit failed",
+				zap.String("topic", *msg.TopicPartition.Topic),
+				zap.Int32("partition", msg.TopicPartition.Partition),
+				zap.Error(err),
+			)
+		}
+	}
+}
+
+func consume(ctx context.Context, c *kafka.Consumer, maxPollRecords int, sleep time.Duration, sinkURL string, httpClient *http.Client, logger *zap.Logger) error {
 	var consumed, consumedBytes atomic.Int64
 	var pushCount, totalPushNs, lastPushNs atomic.Int64
 
@@ -76,32 +172,32 @@ func consume(ctx context.Context, cl *kgo.Client, concurrency int, sleep time.Du
 		default:
 		}
 
-		fetches := cl.PollRecords(ctx, concurrency)
-		if errs := fetches.Errors(); len(errs) > 0 {
-			for _, e := range errs {
-				logger.Error("fetch error", zap.Error(e.Err))
-			}
+		batch, err := collectBatch(ctx, c, maxPollRecords, logger)
+		if err != nil {
+			return err
 		}
-
-		if fetches.Empty() {
+		if len(batch) == 0 {
 			continue
 		}
 
-		records := fetches.Records()
-
 		var batchBytes int64
-		for _, rec := range records {
-			batchBytes += int64(len(rec.Value))
+		for _, msg := range batch {
+			batchBytes += int64(len(msg.Value))
 		}
 
 		grp, grpCtx := errgroup.WithContext(ctx)
-		grp.SetLimit(concurrency)
+		grp.SetLimit(maxPollRecords)
 
-		for _, rec := range records {
+		for _, msg := range batch {
 			grp.Go(func() error {
 				defer func() {
-					logger.Info("sent request", zap.Int64("offset", rec.Offset))
+					logger.Info("processed record",
+						zap.String("topic", *msg.TopicPartition.Topic),
+						zap.Int32("partition", msg.TopicPartition.Partition),
+						zap.Int64("offset", int64(msg.TopicPartition.Offset)),
+					)
 				}()
+
 				if sinkURL == "" {
 					select {
 					case <-grpCtx.Done():
@@ -111,7 +207,7 @@ func consume(ctx context.Context, cl *kgo.Client, concurrency int, sleep time.Du
 					}
 				}
 
-				req, err := http.NewRequestWithContext(grpCtx, http.MethodPost, sinkURL, bytes.NewReader(rec.Value))
+				req, err := http.NewRequestWithContext(grpCtx, http.MethodPost, sinkURL, bytes.NewReader(msg.Value))
 				if err != nil {
 					return err
 				}
@@ -121,9 +217,7 @@ func consume(ctx context.Context, cl *kgo.Client, concurrency int, sleep time.Du
 				if err != nil {
 					return err
 				}
-				defer func() {
-					_ = resp.Body.Close()
-				}()
+				defer func() { _ = resp.Body.Close() }()
 				_, _ = io.Copy(io.Discard, resp.Body)
 
 				dur := time.Since(start)
@@ -140,54 +234,31 @@ func consume(ctx context.Context, cl *kgo.Client, concurrency int, sleep time.Du
 
 		if err := grp.Wait(); err != nil {
 			logger.Error("process error", zap.Error(err))
+			seekBack(c, batch, logger)
 			continue
 		}
 
-		// Commit with the original ctx, not the errgroup ctx,
-		// to avoid cancellation races on errgroup completion.
-		if err := cl.CommitRecords(ctx, records...); err != nil {
-			logger.Error("commit error", zap.Error(err))
-		}
-
-		consumed.Add(int64(len(records)))
+		commitBatch(c, batch, logger)
+		consumed.Add(int64(len(batch)))
 		consumedBytes.Add(batchBytes)
 	}
-}
-
-type readHook struct {
-	logger *zap.Logger
-}
-
-var _ kgo.HookFetchBatchRead = (*readHook)(nil)
-
-func (h *readHook) OnFetchBatchRead(meta kgo.BrokerMetadata, topic string, partition int32, metrics kgo.FetchBatchMetrics) {
-	h.logger.Info("fetch batch read",
-		zap.Int32("broker_id", meta.NodeID),
-		zap.String("topic", topic),
-		zap.Int32("partition", partition),
-		zap.Int("num_records", metrics.NumRecords),
-		zap.Int("compressed_bytes", metrics.CompressedBytes),
-		zap.Int("uncompressed_bytes", metrics.UncompressedBytes),
-		zap.Uint8("compression_type", metrics.CompressionType),
-	)
 }
 
 func main() {
 	brokers := flag.String("brokers", "localhost:9092", "Comma-separated Kafka broker addresses")
 	topic := flag.String("topic", "test-topic", "Kafka topic")
 	group := flag.String("group", "reproducer", "Consumer group ID")
-	concurrency := flag.Int("concurrency", 10, "Max concurrent record processors / PollRecords max")
+	maxPollRecords := flag.Int("max-poll-records", 10, "Max records per poll batch / max concurrent processors")
 	sleep := flag.Duration("sleep", 500*time.Millisecond, "Sleep per record when -sink-url is not set")
 	sinkURL := flag.String("sink-url", "", "HTTP sink URL to POST each record to (e.g. http://sink:8080/)")
 	pushTimeout := flag.Duration("push-timeout", 10*time.Second, "HTTP push timeout per record")
 	pprofAddr := flag.String("pprof-addr", ":6060", "pprof HTTP listen address (empty to disable)")
-	maxConcurrentFetches := flag.Int("max-concurrent-fetches", 1, "MaxConcurrentFetches (0 = default)")
 	logLevelStr := flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 
 	fetchMaxBytes := bytesFlag(50 << 20)          // 50 MiB
 	fetchMaxPartitionBytes := bytesFlag(10 << 20) // 10 MiB
-	flag.Var(&fetchMaxBytes, "fetch-max-bytes", "FetchMaxBytes, human-readable (e.g. 50MiB)")
-	flag.Var(&fetchMaxPartitionBytes, "fetch-max-partition-bytes", "FetchMaxPartitionBytes, human-readable (e.g. 10MiB)")
+	flag.Var(&fetchMaxBytes, "fetch-max-bytes", "fetch.max.bytes, human-readable (e.g. 50MiB)")
+	flag.Var(&fetchMaxPartitionBytes, "fetch-max-partition-bytes", "max.partition.fetch.bytes, human-readable (e.g. 10MiB)")
 
 	flag.Parse()
 
@@ -196,10 +267,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "invalid log level %q: %v\n", *logLevelStr, err)
 		os.Exit(1)
 	}
-	atomicLevel := zap.NewAtomicLevelAt(logLevel)
 
 	cfg := zap.NewDevelopmentConfig()
-	cfg.Level = atomicLevel
+	cfg.Level = zap.NewAtomicLevelAt(logLevel)
 	logger, err := cfg.Build()
 	if err != nil {
 		panic(err)
@@ -223,48 +293,38 @@ func main() {
 		logger.Fatal("get hostname", zap.Error(err))
 	}
 
-	// Mirror the reference: the Kafka client receives the errgroup context,
-	// tying its lifecycle to the consumer goroutine group.
-	grp, grpCtx := errgroup.WithContext(ctx)
-
-	opts := []kgo.Opt{
-		kgo.SeedBrokers(strings.Split(*brokers, ",")...),
-		kgo.ConsumerGroup(*group),
-		kgo.ConsumeTopics(*topic),
-		kgo.InstanceID(hostname + "-" + *topic),
-		kgo.DisableAutoCommit(),
-		kgo.FetchMaxBytes(int32(fetchMaxBytes)),
-		kgo.FetchMaxPartitionBytes(int32(fetchMaxPartitionBytes)),
-		kgo.WithLogger(kzap.New(logger.Named("kafka"), kzap.AtomicLevel(atomicLevel))),
-		kgo.WithHooks(&readHook{logger: logger}),
-	}
-	if *maxConcurrentFetches > 0 {
-		opts = append(opts, kgo.MaxConcurrentFetches(*maxConcurrentFetches))
-	}
-
-	cl, err := kgo.NewClient(opts...)
+	c, err := kafka.NewConsumer(&kafka.ConfigMap{
+		"bootstrap.servers":         *brokers,
+		"group.id":                  *group,
+		"group.instance.id":         hostname,
+		"auto.offset.reset":         "earliest",
+		"enable.auto.commit":        false,
+		"fetch.max.bytes":           int(fetchMaxBytes),
+		"max.partition.fetch.bytes": int(fetchMaxPartitionBytes),
+	})
 	if err != nil {
-		logger.Fatal("create kafka client", zap.Error(err))
+		logger.Fatal("create consumer", zap.Error(err))
 	}
+	defer func() { _ = c.Close() }()
 
-	httpClient := &http.Client{Timeout: *pushTimeout}
+	if err := c.Subscribe(*topic, nil); err != nil {
+		logger.Fatal("subscribe", zap.Error(err))
+	}
 
 	logger.Info("consumer started",
 		zap.String("topic", *topic),
 		zap.String("group", *group),
-		zap.Int("concurrency", *concurrency),
+		zap.String("instance_id", hostname),
+		zap.Int("max_poll_records", *maxPollRecords),
 		zap.Duration("sleep", *sleep),
 		zap.String("sink_url", *sinkURL),
 		zap.String("fetch_max_bytes", fetchMaxBytes.String()),
 		zap.String("fetch_max_partition_bytes", fetchMaxPartitionBytes.String()),
 	)
 
-	grp.Go(func() error {
-		defer cl.Close()
-		return consume(grpCtx, cl, *concurrency, *sleep, *sinkURL, httpClient, logger)
-	})
+	httpClient := &http.Client{Timeout: *pushTimeout}
 
-	if err := grp.Wait(); err != nil {
+	if err := consume(ctx, c, *maxPollRecords, *sleep, *sinkURL, httpClient, logger); err != nil {
 		logger.Fatal("consumer error", zap.Error(err))
 	}
 }
