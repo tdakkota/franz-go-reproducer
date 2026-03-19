@@ -78,7 +78,6 @@ services:
       # - -sink-url=http://sink:8080/
       - -sleep=250ms
       - -fetch-max-bytes=50MiB
-      - -fetch-max-partition-bytes=10MiB
       - -pprof-addr=:6060
     ports:
       - "6061:6060"

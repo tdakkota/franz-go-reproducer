@@ -13,8 +13,7 @@ import (
 	"time"
 
 	"github.com/dustin/go-humanize"
-	"github.com/twmb/franz-go/pkg/kgo"
-	"github.com/twmb/franz-go/plugin/kzap"
+	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -22,7 +21,7 @@ import (
 // bytesFlag is a flag.Value that accepts human-readable byte sizes (e.g. "1MiB", "50MB").
 type bytesFlag uint64
 
-func (b *bytesFlag) String() string        { return humanize.IBytes(uint64(*b)) }
+func (b *bytesFlag) String() string { return humanize.IBytes(uint64(*b)) }
 func (b *bytesFlag) Set(s string) error {
 	v, err := humanize.ParseBytes(s)
 	if err != nil {
@@ -38,10 +37,10 @@ func main() {
 	rate := flag.Duration("rate", 500*time.Millisecond, "Interval between produces")
 	pprofAddr := flag.String("pprof-addr", ":6060", "pprof HTTP listen address (empty to disable)")
 
-	payloadSize := bytesFlag(5 << 20)        // 5 MiB
-	batchMaxBytes := bytesFlag(10 << 20)    // 10 MiB — must exceed payload + framing overhead
+	payloadSize := bytesFlag(5 << 20)    // 5 MiB
+	batchMaxBytes := bytesFlag(10 << 20) // 10 MiB — must exceed payload + framing overhead
 	flag.Var(&payloadSize, "payload-size", "Payload size, human-readable (e.g. 1MiB, 512KB)")
-	flag.Var(&batchMaxBytes, "batch-max-bytes", "ProducerBatchMaxBytes, human-readable (e.g. 10MiB)")
+	flag.Var(&batchMaxBytes, "batch-max-bytes", "BatchBytes for the writer, human-readable (e.g. 10MiB)")
 	logLevelStr := flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 
 	flag.Parse()
@@ -73,16 +72,17 @@ func main() {
 		}()
 	}
 
-	cl, err := kgo.NewClient(
-		kgo.SeedBrokers(strings.Split(*brokers, ",")...),
-		kgo.ProducerBatchCompression(kgo.ZstdCompression()),
-		kgo.ProducerBatchMaxBytes(int32(batchMaxBytes)),
-		kgo.WithLogger(kzap.New(logger.Named("kafka"), kzap.AtomicLevel(atomicLevel))),
-	)
-	if err != nil {
-		logger.Fatal("create kafka client", zap.Error(err))
+	writer := &kafka.Writer{
+		Addr:         kafka.TCP(strings.Split(*brokers, ",")...),
+		Topic:        *topic,
+		Compression:  kafka.Zstd,
+		BatchBytes:   int64(batchMaxBytes),
+		RequiredAcks: kafka.RequireAll,
+		// Low BatchTimeout gives synchronous-like behavior: each WriteMessages call
+		// flushes its message rather than waiting to accumulate a larger batch.
+		BatchTimeout: time.Millisecond,
 	}
-	defer cl.Close()
+	defer writer.Close()
 
 	payload := make([]byte, payloadSize)
 	for i := range payload {
@@ -125,11 +125,8 @@ func main() {
 			)
 			return
 		case <-ticker.C:
-			rec := &kgo.Record{
-				Topic: *topic,
-				Value: payload,
-			}
-			if err := cl.ProduceSync(ctx, rec).FirstErr(); err != nil {
+			msg := kafka.Message{Value: payload}
+			if err := writer.WriteMessages(ctx, msg); err != nil {
 				logger.Error("produce error", zap.Error(err))
 				continue
 			}
