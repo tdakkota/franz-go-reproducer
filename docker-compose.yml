@@ -34,7 +34,10 @@ services:
     restart: on-failure
 
   producer:
-    build: .
+    build:
+      context: .
+      args:
+        LIBRARY: franz-go
     command:
       - /app/producer
       - -brokers=kafka:9092
@@ -68,7 +71,10 @@ services:
   #         memory: 256m
 
   consumer:
-    build: .
+    build:
+      context: .
+      args:
+        LIBRARY: franz-go
     command:
       - /app/consumer
       - -brokers=kafka:9092

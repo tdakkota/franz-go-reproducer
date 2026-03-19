@@ -106,11 +106,33 @@ func loadConfig() (config, error) {
 	return c, nil
 }
 
+func ptr[T any](v T) *T { return &v }
+
+var libraries = []struct {
+	name       string
+	dockerfile string
+	buildArgs  map[string]*string
+}{
+	{"franz-go", "Dockerfile", map[string]*string{"LIBRARY": ptr("franz-go")}},
+	{"sarama", "Dockerfile", map[string]*string{"LIBRARY": ptr("sarama")}},
+	{"segmentio", "Dockerfile", map[string]*string{"LIBRARY": ptr("segmentio")}},
+	{"confluent", "Dockerfile.confluent", nil},
+}
+
 func TestOOMReproducer(t *testing.T) {
 	cfg, err := loadConfig()
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
+	for _, lib := range libraries {
+		t.Run(lib.name, func(t *testing.T) {
+			runOOMTest(t, cfg, lib.dockerfile, lib.buildArgs)
+		})
+	}
+}
+
+func runOOMTest(t *testing.T, cfg config, dockerfile string, buildArgs map[string]*string) {
+	t.Helper()
 
 	// t.Context() is cancelled when the test ends, automatically unblocking any
 	// in-flight operations (lag polling, etc.) on early failure.
@@ -201,7 +223,8 @@ func TestOOMReproducer(t *testing.T) {
 	// reused across producer and consumer container starts/restarts.
 	fromDockerfile := tc.FromDockerfile{
 		Context:    ".",
-		Dockerfile: "Dockerfile",
+		Dockerfile: dockerfile,
+		BuildArgs:  buildArgs,
 		KeepImage:  true,
 	}
 
