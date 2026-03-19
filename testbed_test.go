@@ -27,6 +27,7 @@ const producerMemoryLimit = 256 * 1024 * 1024 // 256 MiB
 
 // config holds all tunable parameters for the testbed.
 type config struct {
+	payloadFile            string // path to a pre-generated payload file; overrides payloadSize
 	payloadSize            string
 	produceRate            string
 	fetchMaxBytes          string
@@ -48,11 +49,14 @@ func loadConfig() (config, error) {
 		concurrency:            2,
 		consumerSleep:          "250ms",
 		lagTarget:              200,
-		consumerMemoryLimit:    256 * 1024 * 1024, // 256 MiB
-		reproTimeout:           5 * time.Minute,
+		consumerMemoryLimit:    256 * 1024 * 1024, // 1 GiB
+		reproTimeout:           time.Minute,
 		expectOOM:              true,
 	}
 
+	if v := os.Getenv("PAYLOAD_FILE"); v != "" {
+		c.payloadFile = v
+	}
 	if v := os.Getenv("PAYLOAD_SIZE"); v != "" {
 		c.payloadSize = v
 	}
@@ -106,16 +110,14 @@ func loadConfig() (config, error) {
 	return c, nil
 }
 
-func ptr[T any](v T) *T { return &v }
-
 var libraries = []struct {
 	name       string
 	dockerfile string
 	buildArgs  map[string]*string
 }{
-	{"franz-go", "Dockerfile", map[string]*string{"LIBRARY": ptr("franz-go")}},
-	{"sarama", "Dockerfile", map[string]*string{"LIBRARY": ptr("sarama")}},
-	{"segmentio", "Dockerfile", map[string]*string{"LIBRARY": ptr("segmentio")}},
+	{"franz-go", "Dockerfile", map[string]*string{"LIBRARY": new("franz-go")}},
+	{"sarama", "Dockerfile", map[string]*string{"LIBRARY": new("sarama")}},
+	{"segmentio", "Dockerfile", map[string]*string{"LIBRARY": new("segmentio")}},
 	{"confluent", "Dockerfile.confluent", nil},
 }
 
@@ -126,17 +128,27 @@ func TestOOMReproducer(t *testing.T) {
 	}
 	for _, lib := range libraries {
 		t.Run(lib.name, func(t *testing.T) {
-			runOOMTest(t, cfg, lib.dockerfile, lib.buildArgs)
+			runOOMTest(t, cfg, lib.name, lib.dockerfile, lib.buildArgs)
 		})
 	}
 }
 
-func runOOMTest(t *testing.T, cfg config, dockerfile string, buildArgs map[string]*string) {
+func runOOMTest(t *testing.T, cfg config, name, dockerfile string, buildArgs map[string]*string) {
 	t.Helper()
 
 	// t.Context() is cancelled when the test ends, automatically unblocking any
 	// in-flight operations (lag polling, etc.) on early failure.
 	ctx := t.Context()
+
+	// withName returns an option that sets the Docker container name to
+	// "<library>-<role>" (e.g. "franz-go-kafka", "sarama-consumer").
+	// Consistent names make docker ps / docker logs much easier to read.
+	withName := func(role string) tc.CustomizeRequestOption {
+		return tc.CustomizeRequestOption(func(req *tc.GenericContainerRequest) error {
+			req.Name = name + "-" + role
+			return nil
+		})
+	}
 
 	// Phase 0 — create shared network and start Kafka (KRaft, no Zookeeper).
 	//
@@ -168,15 +180,17 @@ func runOOMTest(t *testing.T, cfg config, dockerfile string, buildArgs map[strin
 		}
 	})
 
+	kafkaAlias := name + "-kafka"
 	kafkaCtr, err := kafkamodule.Run(ctx, "confluentinc/confluent-local:7.7.3",
-		// Attach to the shared network with alias "kafka".
+		withName("kafka"),
+		// Attach to the shared network with alias "<library>-kafka".
 		// configureControllerQuorumVoters (inside the module) will pick up the
-		// alias and set KAFKA_CONTROLLER_QUORUM_VOTERS=1@kafka:9094.
-		network.WithNetwork([]string{"kafka"}, nw),
+		// alias and set KAFKA_CONTROLLER_QUORUM_VOTERS=1@<alias>:9094.
+		network.WithNetwork([]string{kafkaAlias}, nw),
 		// Pin the container hostname so the BROKER advertised listener becomes
-		// "kafka:9092" — resolvable by producer/consumer on the same network.
+		// "<alias>:9092" — resolvable by producer/consumer on the same network.
 		tc.WithConfigModifier(func(cfg *container.Config) {
-			cfg.Hostname = "kafka"
+			cfg.Hostname = kafkaAlias
 		}),
 		// Raise broker-side message size limits to match the producer payload.
 		tc.WithEnv(map[string]string{
@@ -225,23 +239,42 @@ func runOOMTest(t *testing.T, cfg config, dockerfile string, buildArgs map[strin
 		Context:    ".",
 		Dockerfile: dockerfile,
 		BuildArgs:  buildArgs,
+		Repo:       "testbed",
+		Tag:        name,
 		KeepImage:  true,
 	}
 
 	// Phase 1 — start producer.
 	t.Log("Phase 1: starting producer")
+
+	// Build producer command: use payload file if provided, otherwise generated size.
+	producerCmd := []string{
+		"/app/producer",
+		"-brokers=" + kafkaAlias + ":9092",
+		"-topic=test-topic",
+		"-rate=" + cfg.produceRate,
+		"-pprof-addr=",
+	}
+	var producerFileOpt tc.ContainerCustomizer
+	if cfg.payloadFile != "" {
+		producerCmd = append(producerCmd, "-payload-file=/payload")
+		producerFileOpt = tc.WithFiles(tc.ContainerFile{
+			HostFilePath:      cfg.payloadFile,
+			ContainerFilePath: "/payload",
+			FileMode:          0o444,
+		})
+	} else {
+		producerCmd = append(producerCmd, "-payload-size="+cfg.payloadSize)
+		producerFileOpt = tc.CustomizeRequestOption(func(_ *tc.GenericContainerRequest) error { return nil })
+	}
+
 	producerCtr, err := tc.Run(ctx, "",
 		tc.WithDockerfile(fromDockerfile),
+		withName("producer"),
 		network.WithNetwork([]string{}, nw),
+		producerFileOpt,
 		tc.CustomizeRequestOption(func(req *tc.GenericContainerRequest) error {
-			req.Cmd = []string{
-				"/app/producer",
-				"-brokers=kafka:9092",
-				"-topic=test-topic",
-				"-payload-size=" + cfg.payloadSize,
-				"-rate=" + cfg.produceRate,
-				"-pprof-addr=",
-			}
+			req.Cmd = producerCmd
 			req.WaitingFor = wait.ForLog("producer started")
 			return nil
 		}),
@@ -269,11 +302,12 @@ func runOOMTest(t *testing.T, cfg config, dockerfile string, buildArgs map[strin
 	t.Log("Phase 2: starting consumer")
 	consumerCtr, err := tc.Run(ctx, "",
 		tc.WithDockerfile(fromDockerfile),
+		withName("consumer"),
 		network.WithNetwork([]string{}, nw),
 		tc.CustomizeRequestOption(func(req *tc.GenericContainerRequest) error {
 			req.Cmd = []string{
 				"/app/consumer",
-				"-brokers=kafka:9092",
+				"-brokers=" + kafkaAlias + ":9092",
 				"-topic=test-topic",
 				"-group=reproducer",
 				"-concurrency=" + strconv.Itoa(cfg.concurrency),
@@ -375,7 +409,7 @@ func runOOMTest(t *testing.T, cfg config, dockerfile string, buildArgs map[strin
 	select {
 	case <-oomCh:
 		oomCancel()
-		t.Log("OOM reproduced successfully")
+		t.Logf("OOM reproduced successfully (%s)", name)
 	case <-time.After(cfg.reproTimeout):
 		oomCancel()
 		if cfg.expectOOM {
@@ -387,9 +421,13 @@ func runOOMTest(t *testing.T, cfg config, dockerfile string, buildArgs map[strin
 }
 
 // waitForLag polls kadm every 2s until total group lag >= target.
+// It returns an error if lag decreases between any two consecutive samples,
+// which indicates an unexpected consumer is running while the consumer under
+// test is supposed to be stopped.
 func waitForLag(ctx context.Context, adm *kadm.Client, group string, target int64, t *testing.T) error {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
+	var prev int64 = -1
 	for {
 		select {
 		case <-ctx.Done():
@@ -406,6 +444,10 @@ func waitForLag(ctx context.Context, adm *kadm.Client, group string, target int6
 			}
 			total := gl.Lag.Total()
 			t.Logf("current lag: %d / %d", total, target)
+			if prev >= 0 && total < prev {
+				return fmt.Errorf("lag decreased from %d to %d while consumer is stopped (unexpected consumer active?)", prev, total)
+			}
+			prev = total
 			if total >= target {
 				return nil
 			}

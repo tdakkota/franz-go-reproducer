@@ -37,9 +37,10 @@ func main() {
 	rate := flag.Duration("rate", 500*time.Millisecond, "Interval between produces")
 	pprofAddr := flag.String("pprof-addr", ":6060", "pprof HTTP listen address (empty to disable)")
 
+	payloadFile := flag.String("payload-file", "", "Path to a file whose contents are used as the record payload (overrides -payload-size)")
 	payloadSize := bytesFlag(5 << 20)    // 5 MiB
 	batchMaxBytes := bytesFlag(10 << 20) // 10 MiB — must exceed payload + framing overhead
-	flag.Var(&payloadSize, "payload-size", "Payload size, human-readable (e.g. 1MiB, 512KB)")
+	flag.Var(&payloadSize, "payload-size", "Payload size, human-readable (e.g. 1MiB, 512KB); ignored when -payload-file is set")
 	flag.Var(&batchMaxBytes, "batch-max-bytes", "BatchBytes for the writer, human-readable (e.g. 10MiB)")
 	logLevelStr := flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 
@@ -84,9 +85,18 @@ func main() {
 	}
 	defer writer.Close()
 
-	payload := make([]byte, payloadSize)
-	for i := range payload {
-		payload[i] = byte(i % 256)
+	var payload []byte
+	if *payloadFile != "" {
+		var err error
+		payload, err = os.ReadFile(*payloadFile)
+		if err != nil {
+			logger.Fatal("read payload file", zap.String("path", *payloadFile), zap.Error(err))
+		}
+	} else {
+		payload = make([]byte, payloadSize)
+		for i := range payload {
+			payload[i] = byte(i % 256)
+		}
 	}
 
 	ticker := time.NewTicker(*rate)
