@@ -69,7 +69,8 @@ func (h *consumerHandler) ConsumeClaim(session sarama.ConsumerGroupSession, clai
 				if err := h.processRecord(grpCtx, msg.Value); err != nil {
 					return err
 				}
-				h.consumed.Add(1)
+			session.MarkMessage(msg, "")
+			h.consumed.Add(1)
 				h.consumedBytes.Add(int64(len(msg.Value)))
 				return nil
 			})
@@ -169,7 +170,8 @@ func main() {
 	saramaConfig.Version = sarama.V2_8_0_0
 	saramaConfig.Consumer.Fetch.Max = int32(fetchMaxBytes)
 	saramaConfig.Consumer.Fetch.Default = int32(fetchMaxPartitionBytes)
-	saramaConfig.Consumer.Offsets.AutoCommit.Enable = false
+	saramaConfig.Consumer.Offsets.AutoCommit.Enable = true
+	saramaConfig.Consumer.Offsets.AutoCommit.Interval = 1 * time.Second
 	saramaConfig.Consumer.Offsets.Initial = sarama.OffsetOldest
 	saramaConfig.ChannelBufferSize = *channelBufferSize
 

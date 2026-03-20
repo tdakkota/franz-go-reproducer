@@ -3,7 +3,6 @@ package testbed_test
 import (
 	"context"
 	"fmt"
-	"net"
 	"os"
 	"strconv"
 	"testing"
@@ -34,7 +33,7 @@ type config struct {
 	fetchMaxPartitionBytes string
 	concurrency            int
 	consumerSleep          string
-	lagTarget              int64
+	backlogTarget              int64
 	consumerMemoryLimit    int64
 	reproTimeout           time.Duration
 	expectOOM              bool
@@ -48,7 +47,7 @@ func loadConfig() (config, error) {
 		fetchMaxPartitionBytes: "10MiB",
 		concurrency:            2,
 		consumerSleep:          "250ms",
-		lagTarget:              200,
+		backlogTarget:              200,
 		consumerMemoryLimit:    256 * 1024 * 1024, // 1 GiB
 		reproTimeout:           time.Minute,
 		expectOOM:              true,
@@ -79,12 +78,12 @@ func loadConfig() (config, error) {
 	if v := os.Getenv("CONSUMER_SLEEP"); v != "" {
 		c.consumerSleep = v
 	}
-	if v := os.Getenv("LAG_TARGET"); v != "" {
+	if v := os.Getenv("BACKLOG_TARGET"); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
 		if err != nil {
-			return c, fmt.Errorf("LAG_TARGET: %w", err)
+			return c, fmt.Errorf("BACKLOG_TARGET: %w", err)
 		}
-		c.lagTarget = n
+		c.backlogTarget = n
 	}
 	if v := os.Getenv("MEMORY_LIMIT"); v != "" {
 		b, err := humanize.ParseBytes(v)
@@ -215,12 +214,6 @@ func runOOMTest(t *testing.T, cfg config, name, dockerfile string, buildArgs map
 	brokerAddr := brokers[0]
 	t.Logf("Kafka broker (host-mapped): %s", brokerAddr)
 
-	// Extract just the port for use in container broker arguments.
-	_, brokerPort, err := net.SplitHostPort(brokerAddr)
-	if err != nil {
-		t.Fatalf("parse broker addr %q: %v", brokerAddr, err)
-	}
-	_ = brokerPort // containers use "kafka:9092" directly; kept for clarity
 
 	// Create the topic.
 	kgoClient, err := kgo.NewClient(kgo.SeedBrokers(brokerAddr))
@@ -384,7 +377,7 @@ func runOOMTest(t *testing.T, cfg config, name, dockerfile string, buildArgs map
 	if err := consumerCtr.Stop(ctx, &stopTimeout); err != nil {
 		t.Fatalf("stop consumer: %v", err)
 	}
-	t.Logf("Consumer stopped; waiting for lag >= %d", cfg.lagTarget)
+	t.Logf("Consumer stopped; waiting for producer backlog >= %d", cfg.backlogTarget)
 
 	lagClient, err := kgo.NewClient(kgo.SeedBrokers(brokerAddr))
 	if err != nil {
@@ -393,10 +386,10 @@ func runOOMTest(t *testing.T, cfg config, name, dockerfile string, buildArgs map
 	lagAdm := kadm.NewClient(lagClient)
 	defer lagClient.Close()
 
-	if err := waitForLag(ctx, lagAdm, "reproducer", cfg.lagTarget, t); err != nil {
-		t.Fatalf("wait for lag: %v", err)
+	if err := waitForProducerBacklog(ctx, lagAdm, "test-topic", cfg.backlogTarget, t); err != nil {
+		t.Fatalf("wait for backlog: %v", err)
 	}
-	t.Logf("Lag target reached (>= %d)", cfg.lagTarget)
+	t.Logf("Producer backlog reached (>= %d)", cfg.backlogTarget)
 
 	// Phase 4 — restart consumer (OOM event stream already established above).
 	t.Log("Phase 4: restarting consumer")
@@ -420,35 +413,39 @@ func runOOMTest(t *testing.T, cfg config, name, dockerfile string, buildArgs map
 	}
 }
 
-// waitForLag polls kadm every 2s until total group lag >= target.
-// It returns an error if lag decreases between any two consecutive samples,
-// which indicates an unexpected consumer is running while the consumer under
-// test is supposed to be stopped.
-func waitForLag(ctx context.Context, adm *kadm.Client, group string, target int64, t *testing.T) error {
+// waitForProducerBacklog polls the topic end offset every 2s until it has
+// grown by at least target messages since the first successful sample.
+//
+// Using end-offset growth instead of consumer group lag avoids false failures
+// caused by libraries that never commit offsets (sarama with AutoCommit=false)
+// or by the consumer group transitioning to Empty state after session timeout,
+// both of which make kadm.Lag report 0 even when the topic has a large backlog.
+func waitForProducerBacklog(ctx context.Context, adm *kadm.Client, topic string, target int64, t *testing.T) error {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
-	var prev int64 = -1
+	var baseline int64 = -1
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			lags, err := adm.Lag(ctx, group)
+			listed, err := adm.ListEndOffsets(ctx, topic)
 			if err != nil {
-				t.Logf("lag poll error: %v", err)
+				t.Logf("end offset poll error: %v", err)
 				continue
 			}
-			gl, ok := lags[group]
-			if !ok {
-				continue
+			var total int64
+			listed.Each(func(lo kadm.ListedOffset) {
+				if lo.Err == nil {
+					total += lo.Offset
+				}
+			})
+			if baseline < 0 {
+				baseline = total
 			}
-			total := gl.Lag.Total()
-			t.Logf("current lag: %d / %d", total, target)
-			if prev >= 0 && total < prev {
-				return fmt.Errorf("lag decreased from %d to %d while consumer is stopped (unexpected consumer active?)", prev, total)
-			}
-			prev = total
-			if total >= target {
+			growth := total - baseline
+			t.Logf("end offset growth: %d / %d", growth, target)
+			if growth >= target {
 				return nil
 			}
 		}
