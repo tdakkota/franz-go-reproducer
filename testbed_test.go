@@ -33,7 +33,7 @@ type config struct {
 	fetchMaxPartitionBytes string
 	concurrency            int
 	consumerSleep          string
-	backlogTarget              int64
+	backlogTarget          int64
 	consumerMemoryLimit    int64
 	reproTimeout           time.Duration
 	expectOOM              bool
@@ -47,8 +47,8 @@ func loadConfig() (config, error) {
 		fetchMaxPartitionBytes: "10MiB",
 		concurrency:            2,
 		consumerSleep:          "250ms",
-		backlogTarget:              200,
-		consumerMemoryLimit:    256 * 1024 * 1024, // 1 GiB
+		backlogTarget:          200,
+		consumerMemoryLimit:    256 * 1024 * 1024, // 256 MiB
 		reproTimeout:           time.Minute,
 		expectOOM:              true,
 	}
@@ -213,7 +213,6 @@ func runOOMTest(t *testing.T, cfg config, name, dockerfile string, buildArgs map
 	}
 	brokerAddr := brokers[0]
 	t.Logf("Kafka broker (host-mapped): %s", brokerAddr)
-
 
 	// Create the topic.
 	kgoClient, err := kgo.NewClient(kgo.SeedBrokers(brokerAddr))

@@ -6,12 +6,12 @@
 package main
 
 import (
-	"crypto/rand"
 	"flag"
 	"fmt"
 	"os"
 
 	"github.com/dustin/go-humanize"
+	"github.com/tdakkota/franz-go-reproducer/internal/payload"
 )
 
 func main() {
@@ -26,21 +26,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	buf := make([]byte, size)
-	switch *pattern {
-	case "sequential":
-		for i := range buf {
-			buf[i] = byte(i % 256)
-		}
-	case "zeros":
-		// buf is already zeroed
-	case "random":
-		if _, err := rand.Read(buf); err != nil {
-			fmt.Fprintf(os.Stderr, "rand.Read: %v\n", err)
-			os.Exit(1)
-		}
-	default:
-		fmt.Fprintf(os.Stderr, "unknown pattern %q; choose: sequential, zeros, random\n", *pattern)
+	buf, err := payload.Generate(size, *pattern)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
 

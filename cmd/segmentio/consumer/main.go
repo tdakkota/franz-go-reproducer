@@ -1,38 +1,24 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"flag"
 	"fmt"
-	"io"
 	"net/http"
-	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/dustin/go-humanize"
-	"github.com/segmentio/kafka-go"
+	kafka "github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/tdakkota/franz-go-reproducer/internal/apputil"
+	"github.com/tdakkota/franz-go-reproducer/internal/consumer"
+	"github.com/tdakkota/franz-go-reproducer/internal/flagutil"
 )
-
-// bytesFlag is a flag.Value that accepts human-readable byte sizes (e.g. "50MiB", "10MB").
-type bytesFlag uint64
-
-func (b *bytesFlag) String() string { return humanize.IBytes(uint64(*b)) }
-func (b *bytesFlag) Set(s string) error {
-	v, err := humanize.ParseBytes(s)
-	if err != nil {
-		return fmt.Errorf("invalid byte size %q: %w", s, err)
-	}
-	*b = bytesFlag(v)
-	return nil
-}
 
 // fetchBatch fetches up to maxMessages from the reader.
 // The first message is fetched with a blocking call; subsequent messages are
@@ -56,10 +42,7 @@ func fetchBatch(ctx context.Context, reader *kafka.Reader, maxMessages int) ([]k
 	return msgs, nil
 }
 
-func consume(ctx context.Context, reader *kafka.Reader, concurrency int, sleep time.Duration, sinkURL string, httpClient *http.Client, logger *zap.Logger) error {
-	var consumed, consumedBytes atomic.Int64
-	var pushCount, totalPushNs, lastPushNs atomic.Int64
-
+func consume(ctx context.Context, reader *kafka.Reader, concurrency int, sleep time.Duration, sinkURL string, httpClient *http.Client, logger *zap.Logger, m *consumer.Metrics) error {
 	go func() {
 		t := time.NewTicker(10 * time.Second)
 		defer t.Stop()
@@ -68,21 +51,6 @@ func consume(ctx context.Context, reader *kafka.Reader, concurrency int, sleep t
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				fields := []zap.Field{
-					zap.Int64("records", consumed.Load()),
-					zap.String("bytes", humanize.IBytes(uint64(consumedBytes.Load()))),
-				}
-				if n := pushCount.Load(); n > 0 {
-					avg := time.Duration(totalPushNs.Load() / n)
-					last := time.Duration(lastPushNs.Load())
-					fields = append(fields,
-						zap.Int64("push_requests", n),
-						zap.Duration("push_avg_latency", avg),
-						zap.Duration("push_last_latency", last),
-					)
-				}
-				logger.Info("consumed", fields...)
-
 				stats := reader.Stats()
 				logger.Info("reader stats",
 					zap.Int64("fetches", stats.Fetches),
@@ -99,8 +67,8 @@ func consume(ctx context.Context, reader *kafka.Reader, concurrency int, sleep t
 		select {
 		case <-ctx.Done():
 			logger.Info("consumer stopped",
-				zap.Int64("consumed_records", consumed.Load()),
-				zap.String("consumed_bytes", humanize.IBytes(uint64(consumedBytes.Load()))),
+				zap.Int64("consumed_records", m.Consumed()),
+				zap.String("consumed_bytes", humanize.IBytes(uint64(m.ConsumedBytes()))),
 			)
 			return nil
 		default:
@@ -128,39 +96,7 @@ func consume(ctx context.Context, reader *kafka.Reader, concurrency int, sleep t
 				defer func() {
 					logger.Info("sent request", zap.Int64("offset", msg.Offset))
 				}()
-				if sinkURL == "" {
-					select {
-					case <-grpCtx.Done():
-						return grpCtx.Err()
-					case <-time.After(sleep):
-						return nil
-					}
-				}
-
-				req, err := http.NewRequestWithContext(grpCtx, http.MethodPost, sinkURL, bytes.NewReader(msg.Value))
-				if err != nil {
-					return err
-				}
-
-				start := time.Now()
-				resp, err := httpClient.Do(req)
-				if err != nil {
-					return err
-				}
-				defer func() {
-					_ = resp.Body.Close()
-				}()
-				_, _ = io.Copy(io.Discard, resp.Body)
-
-				dur := time.Since(start)
-				pushCount.Add(1)
-				totalPushNs.Add(dur.Nanoseconds())
-				lastPushNs.Store(dur.Nanoseconds())
-
-				if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-					return fmt.Errorf("sink returned %d", resp.StatusCode)
-				}
-				return nil
+				return consumer.ProcessRecord(grpCtx, msg.Value, sleep, sinkURL, httpClient, m)
 			})
 		}
 
@@ -175,8 +111,7 @@ func consume(ctx context.Context, reader *kafka.Reader, concurrency int, sleep t
 			logger.Error("commit error", zap.Error(err))
 		}
 
-		consumed.Add(int64(len(messages)))
-		consumedBytes.Add(batchBytes)
+		m.Add(int64(len(messages)), batchBytes)
 	}
 }
 
@@ -191,39 +126,24 @@ func main() {
 	pprofAddr := flag.String("pprof-addr", ":6060", "pprof HTTP listen address (empty to disable)")
 	logLevelStr := flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 
-	fetchMaxBytes := bytesFlag(50 << 20)          // 50 MiB
-	fetchMaxPartitionBytes := bytesFlag(10 << 20) // 10 MiB (registered for flag compatibility; kafka-go has no per-partition cap)
+	fetchMaxBytes := flagutil.BytesFlag(50 << 20)          // 50 MiB
+	fetchMaxPartitionBytes := flagutil.BytesFlag(10 << 20) // 10 MiB (registered for flag compatibility; kafka-go has no per-partition cap)
 	flag.Var(&fetchMaxBytes, "fetch-max-bytes", "MaxBytes per fetch request, human-readable (e.g. 50MiB)")
 	flag.Var(&fetchMaxPartitionBytes, "fetch-max-partition-bytes", "Registered for flag compatibility; kafka-go has no per-partition fetch cap")
 
 	flag.Parse()
 
-	var logLevel zapcore.Level
-	if err := logLevel.UnmarshalText([]byte(*logLevelStr)); err != nil {
-		fmt.Fprintf(os.Stderr, "invalid log level %q: %v\n", *logLevelStr, err)
-		os.Exit(1)
-	}
-	atomicLevel := zap.NewAtomicLevelAt(logLevel)
-
-	cfg := zap.NewDevelopmentConfig()
-	cfg.Level = atomicLevel
-	logger, err := cfg.Build()
+	logger, _, err := apputil.BuildLogger(*logLevelStr)
 	if err != nil {
-		panic(err)
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
 	}
 	defer logger.Sync() //nolint:errcheck
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	if *pprofAddr != "" {
-		go func() {
-			logger.Info("pprof listening", zap.String("addr", *pprofAddr))
-			if err := http.ListenAndServe(*pprofAddr, nil); err != nil {
-				logger.Error("pprof server error", zap.Error(err))
-			}
-		}()
-	}
+	apputil.StartPPROF(*pprofAddr, logger)
 
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:        strings.Split(*brokers, ","),
@@ -246,7 +166,10 @@ func main() {
 		zap.String("fetch_max_bytes", fetchMaxBytes.String()),
 	)
 
-	if err := consume(ctx, reader, *concurrency, *sleep, *sinkURL, httpClient, logger); err != nil {
+	m := new(consumer.Metrics)
+	m.StartTicker(ctx, logger)
+
+	if err := consume(ctx, reader, *concurrency, *sleep, *sinkURL, httpClient, logger, m); err != nil {
 		logger.Fatal("consumer error", zap.Error(err))
 	}
 }
