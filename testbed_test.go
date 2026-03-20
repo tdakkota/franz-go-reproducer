@@ -35,7 +35,7 @@ type config struct {
 	consumerSleep          string
 	backlogTarget          int64
 	consumerMemoryLimit    int64
-	reproTimeout           time.Duration
+	oomStressDuration      time.Duration
 	expectOOM              bool
 }
 
@@ -43,13 +43,13 @@ func loadConfig() (config, error) {
 	c := config{
 		payloadSize:            "5MiB",
 		produceRate:            "500ms",
-		fetchMaxBytes:          "50MiB",
-		fetchMaxPartitionBytes: "10MiB",
+		fetchMaxBytes:          "5MiB",
+		fetchMaxPartitionBytes: "1MiB",
 		concurrency:            2,
 		consumerSleep:          "250ms",
 		backlogTarget:          200,
 		consumerMemoryLimit:    256 * 1024 * 1024, // 256 MiB
-		reproTimeout:           time.Minute,
+		oomStressDuration:      15 * time.Second,
 		expectOOM:              true,
 	}
 
@@ -92,12 +92,15 @@ func loadConfig() (config, error) {
 		}
 		c.consumerMemoryLimit = int64(b)
 	}
-	if v := os.Getenv("REPRO_TIMEOUT"); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return c, fmt.Errorf("REPRO_TIMEOUT: %w", err)
+	for _, key := range []string{"OOM_STRESS_DURATION", "REPRO_TIMEOUT"} {
+		if v := os.Getenv(key); v != "" {
+			d, err := time.ParseDuration(v)
+			if err != nil {
+				return c, fmt.Errorf("%s: %w", key, err)
+			}
+			c.oomStressDuration = d
+			break
 		}
-		c.reproTimeout = d
 	}
 	if v := os.Getenv("EXPECT_OOM"); v != "" {
 		b, err := strconv.ParseBool(v)
@@ -347,7 +350,9 @@ func runOOMTest(t *testing.T, cfg config, name, dockerfile string, buildArgs map
 	)
 	eventsCh, errsCh := dockerCli.Events(oomCtx, events.ListOptions{Filters: oomFilter})
 
-	oomCh := make(chan struct{}, 1)
+	// oomCh delivers one signal per OOM event. Unbuffered so the goroutine blocks
+	// until Phase 5 consumes each event, ensuring none are dropped.
+	oomCh := make(chan struct{})
 	go func() {
 		for {
 			select {
@@ -360,10 +365,10 @@ func runOOMTest(t *testing.T, cfg config, name, dockerfile string, buildArgs map
 				return
 			case ev := <-eventsCh:
 				if ev.Action == events.ActionOOM {
-					t.Logf("OOM event received for container %s", ev.Actor.ID)
 					select {
 					case oomCh <- struct{}{}:
-					default:
+					case <-oomCtx.Done():
+						return
 					}
 				}
 			}
@@ -397,19 +402,83 @@ func runOOMTest(t *testing.T, cfg config, name, dockerfile string, buildArgs map
 	}
 	t.Log("Consumer restarted; waiting for OOM or timeout")
 
-	// Phase 5 — detect OOM or timeout.
-	select {
-	case <-oomCh:
-		oomCancel()
-		t.Logf("OOM reproduced successfully (%s)", name)
-	case <-time.After(cfg.reproTimeout):
-		oomCancel()
-		if cfg.expectOOM {
-			t.Fatalf("no OOM detected within %s (EXPECT_OOM=true)", cfg.reproTimeout)
-		} else {
-			t.Logf("no OOM within %s (EXPECT_OOM=false, test passes)", cfg.reproTimeout)
+	// Phase 5 — OOM stress: restart the consumer on each OOM and count them.
+	// Runs for oomStressDuration, logging per-OOM uptime and a final summary.
+	t.Logf("Phase 5: OOM stress testing for %s", cfg.oomStressDuration)
+	logConsumerLag(ctx, lagAdm, "test-topic", "reproducer", t)
+
+	stressTimer := time.NewTimer(cfg.oomStressDuration)
+	defer stressTimer.Stop()
+
+	oomCount := 0
+	restartCount := 0
+	upStart := time.Now()
+
+stress:
+	for {
+		select {
+		case <-ctx.Done():
+			break stress
+		case <-stressTimer.C:
+			break stress
+		case <-oomCh:
+			uptime := time.Since(upStart)
+			oomCount++
+			t.Logf("OOM #%d for container %s (uptime=%s)", oomCount, consumerID, uptime.Round(time.Millisecond))
+			logConsumerLag(ctx, lagAdm, "test-topic", "reproducer", t)
+
+			if err := consumerCtr.Start(ctx); err != nil {
+				t.Logf("restart consumer after OOM #%d: %v (stopping stress)", oomCount, err)
+				break stress
+			}
+			restartCount++
+			upStart = time.Now()
+			t.Logf("Consumer restarted (#%d)", restartCount)
 		}
 	}
+
+	oomCancel()
+	t.Logf("OOM stress complete: OOM count=%d, restarts=%d", oomCount, restartCount)
+	logConsumerLag(ctx, lagAdm, "test-topic", "reproducer", t)
+	if oomCount == 0 {
+		if cfg.expectOOM {
+			t.Fatalf("no OOM detected within %s (EXPECT_OOM=true)", cfg.oomStressDuration)
+		} else {
+			t.Logf("no OOM within %s (EXPECT_OOM=false, test passes)", cfg.oomStressDuration)
+		}
+	}
+}
+
+// logConsumerLag fetches and logs the end offset, committed offset, and lag
+// for the given consumer group and topic. Errors are logged but not fatal.
+func logConsumerLag(ctx context.Context, adm *kadm.Client, topic, group string, t *testing.T) {
+	t.Helper()
+
+	lags, err := adm.Lag(ctx, group)
+	if err != nil {
+		t.Logf("lag check error: %v", err)
+		return
+	}
+	dl, ok := lags[group]
+	if !ok || dl.Error() != nil {
+		t.Logf("lag check: group %q: %v", group, dl.Error())
+		return
+	}
+	partitions, ok := dl.Lag[topic]
+	if !ok {
+		t.Logf("lag check: no lag data for topic %q", topic)
+		return
+	}
+	var endTotal, committedTotal int64
+	for _, pl := range partitions {
+		if pl.End.Err == nil {
+			endTotal += pl.End.Offset
+		}
+		if pl.Err == nil && pl.Commit.At >= 0 {
+			committedTotal += pl.Commit.At
+		}
+	}
+	t.Logf("offsets: end=%d committed=%d lag=%d", endTotal, committedTotal, dl.Lag.Total())
 }
 
 // waitForProducerBacklog polls the topic end offset every 2s until it has
